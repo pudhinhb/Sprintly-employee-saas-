@@ -1,0 +1,2273 @@
+import 'dart:async';
+import 'package:flutter/material.dart';
+import 'package:flutter/gestures.dart';
+import 'package:flutter/services.dart';
+import 'package:provider/provider.dart';
+import '../../widgets/task_details_dialog.dart';
+import 'package:flutter_hooks/flutter_hooks.dart';
+import '../../widgets/app_bar_search_filter.dart';
+import '../dashboard/modern_dashboard_screen.dart';
+import '../../widgets/congratulations_overlay.dart';
+import 'package:webnox_taskops/model/task_model.dart';
+import 'package:webnox_taskops/helpers/app_theme.dart';
+import 'package:webnox_taskops/widgets/common_widgets.dart';
+import 'package:webnox_taskops/view_model/task_view_model.dart';
+import 'package:webnox_taskops/view_model/auth_view_model.dart';
+import 'package:webnox_taskops/view_model/kanban_view_model.dart';
+import 'package:webnox_taskops/services/task_card_log_service.dart';
+import 'package:flutter_staggered_animations/flutter_staggered_animations.dart';
+
+// Task status enum for kanban columns
+enum KanbanTaskStatus {
+  todo,
+  inProgress,
+  devcompleted,
+  inQc,
+  workDone,
+  redo,
+}
+
+class KanbanBoardScreen extends HookWidget {
+  const KanbanBoardScreen({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    // Get ViewModels
+    final kanbanViewModel = Provider.of<KanbanViewModel>(context);
+    final authViewModel = Provider.of<AuthViewModel>(context);
+    final isDesktop = MediaQuery.of(context).size.width > 1200;
+
+    // UI-specific state only (not managed by ViewModel)
+    final searchController = useTextEditingController();
+    final showSuggestions = useState<bool>(false);
+    final searchFocusNode = useFocusNode();
+    final searchBarKey = useMemoized(() => GlobalKey());
+    final suggestionsOverlay = useRef<OverlayEntry?>(null);
+    final isSearchVisible = useState<bool>(false);
+
+    // Auto-scroll state for drag operations (UI-specific)
+    final verticalScrollController = useState<ScrollController?>(null);
+    final horizontalScrollController = useState<ScrollController?>(null);
+    final isDragging = useState<bool>(false);
+    final dragPosition = useState<Offset?>(null);
+    final autoScrollTimer = useState<Timer?>(null);
+
+    // Initialize and load tasks on mount
+    useEffect(() {
+      // Initialize scroll controllers
+      verticalScrollController.value = ScrollController();
+      horizontalScrollController.value = ScrollController();
+
+      // Load tasks via ViewModel
+      Future.microtask(() => kanbanViewModel.loadTasks(authViewModel));
+
+      return () {
+        // Cleanup
+        autoScrollTimer.value?.cancel();
+        verticalScrollController.value?.dispose();
+        horizontalScrollController.value?.dispose();
+        verticalScrollController.value = null;
+        horizontalScrollController.value = null;
+      };
+    }, []);
+
+    // Refresh function for pull-to-refresh
+    Future<void> refreshTasks() async {
+      await kanbanViewModel.loadTasks(authViewModel);
+    }
+
+    // Helper function to show/hide suggestions overlay
+    OverlayEntry? _showSuggestionsOverlay(
+      BuildContext context,
+      GlobalKey searchBarKey,
+      List<String> suggestions,
+      TextEditingController searchController,
+      ValueNotifier<String> searchQuery,
+      ValueNotifier<bool> showSuggestions,
+      FocusNode searchFocusNode,
+      bool isSmallMobile,
+    ) {
+      final overlay = Overlay.of(context);
+      final renderBox =
+          searchBarKey.currentContext?.findRenderObject() as RenderBox?;
+
+      if (renderBox == null || suggestions.isEmpty) return null;
+
+      final size = renderBox.size;
+      final offset = renderBox.localToGlobal(Offset.zero);
+
+      OverlayEntry? overlayEntry;
+      overlayEntry = OverlayEntry(
+        builder: (context) => Positioned(
+          top: offset.dy + size.height + 4,
+          left: offset.dx,
+          width: size.width,
+          child: Material(
+            elevation: 8,
+            borderRadius: BorderRadius.circular(12),
+            color: Colors.transparent,
+            child: Container(
+              constraints: BoxConstraints(
+                maxHeight: 200,
+              ),
+              decoration: BoxDecoration(
+                color: Theme.of(context).cardColor,
+                borderRadius: BorderRadius.circular(12),
+                border: Border.all(
+                  color: Theme.of(context).dividerColor.withOpacity(0.2),
+                  width: 1,
+                ),
+                boxShadow: [
+                  BoxShadow(
+                    color: Colors.black.withOpacity(0.15),
+                    blurRadius: 12,
+                    offset: Offset(0, 4),
+                    spreadRadius: 0,
+                  ),
+                ],
+              ),
+              child: ListView.builder(
+                shrinkWrap: true,
+                physics: ClampingScrollPhysics(),
+                itemCount: suggestions.length,
+                itemBuilder: (context, index) {
+                  final suggestion = suggestions[index];
+                  return InkWell(
+                    onTap: () {
+                      searchController.text = suggestion;
+                      searchQuery.value = suggestion;
+                      showSuggestions.value = false;
+                      searchFocusNode.unfocus();
+                      overlayEntry?.remove();
+                    },
+                    child: Container(
+                      padding: EdgeInsets.symmetric(
+                        horizontal: isSmallMobile ? 20 : 16,
+                        vertical: 14,
+                      ),
+                      child: Row(
+                        children: [
+                          Icon(
+                            Icons.search,
+                            size: 18,
+                            color: Theme.of(context)
+                                .textTheme
+                                .bodyMedium
+                                ?.color
+                                ?.withOpacity(0.6),
+                          ),
+                          SizedBox(width: 12),
+                          Expanded(
+                            child: Text(
+                              suggestion,
+                              style: TextStyle(
+                                color: Theme.of(context)
+                                    .textTheme
+                                    .bodyLarge
+                                    ?.color,
+                                fontSize: 14,
+                              ),
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  );
+                },
+              ),
+            ),
+          ),
+        ),
+      );
+
+      overlay.insert(overlayEntry);
+      return overlayEntry;
+    }
+
+    // Auto-scroll logic for drag operations
+    void _startAutoScroll() {
+      autoScrollTimer.value?.cancel();
+      autoScrollTimer.value =
+          Timer.periodic(const Duration(milliseconds: 8), (timer) {
+        if (!isDragging.value || horizontalScrollController.value == null) {
+          timer.cancel();
+          return;
+        }
+
+        final position = dragPosition.value;
+        if (position == null) return;
+
+        final screenWidth = MediaQuery.of(context).size.width;
+        final scrollController = horizontalScrollController.value!;
+        final scrollOffset = scrollController.offset;
+        final maxScroll = scrollController.position.maxScrollExtent;
+
+        // Define edge zones for auto-scroll (15% of screen width from edges for more responsive feel)
+        final edgeZone = screenWidth * 0.15;
+
+        // Calculate dynamic scroll speed based on distance from edge
+        double scrollSpeed;
+        if (position.dx < edgeZone) {
+          // Closer to left edge = faster scroll
+          final distanceFromEdge = edgeZone - position.dx;
+          scrollSpeed = (distanceFromEdge / edgeZone) * 25.0 +
+              10.0; // 10-35 pixels per frame
+        } else if (position.dx > screenWidth - edgeZone) {
+          // Closer to right edge = faster scroll
+          final distanceFromEdge = position.dx - (screenWidth - edgeZone);
+          scrollSpeed = (distanceFromEdge / edgeZone) * 25.0 +
+              10.0; // 10-35 pixels per frame
+        } else {
+          return; // Not in edge zone
+        }
+
+        if (position.dx < edgeZone && scrollOffset > 0) {
+          // Scroll left
+          final newOffset = (scrollOffset - scrollSpeed).clamp(0.0, maxScroll);
+          scrollController
+              .jumpTo(newOffset); // Use jumpTo for immediate response
+        } else if (position.dx > screenWidth - edgeZone &&
+            scrollOffset < maxScroll) {
+          // Scroll right
+          final newOffset = (scrollOffset + scrollSpeed).clamp(0.0, maxScroll);
+          scrollController
+              .jumpTo(newOffset); // Use jumpTo for immediate response
+        }
+      });
+    }
+
+    void _stopAutoScroll() {
+      autoScrollTimer.value?.cancel();
+      autoScrollTimer.value = null;
+    }
+
+    void _updateDragPosition(Offset position) {
+      dragPosition.value = position;
+    }
+
+    void _onDragStarted() {
+      isDragging.value = true;
+      _startAutoScroll();
+    }
+
+    void _onDragEnd() {
+      isDragging.value = false;
+      dragPosition.value = null;
+      _stopAutoScroll();
+    }
+
+    // Show filter dialog
+    void _showFilterDialog(
+        BuildContext context,
+        ValueNotifier<Set<String>> selectedPriorities,
+        ValueNotifier<Set<String>> selectedStatuses,
+        ValueNotifier<Set<String>> selectedProjects,
+        Map<String, List<String>> filterOptions,
+        VoidCallback onClearFilters,
+        VoidCallback onUpdateFilters,
+        ValueNotifier<bool> hasActiveFilters) {
+      // Local state for dialog
+      final localPriorities = Set<String>.from(selectedPriorities.value);
+      final localStatuses = Set<String>.from(selectedStatuses.value);
+      final localProjects = Set<String>.from(selectedProjects.value);
+
+      showDialog(
+        context: context,
+        builder: (BuildContext dialogContext) {
+          return StatefulBuilder(
+            builder: (context, setState) {
+              return AlertDialog(
+                title: Row(
+                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                  children: [
+                    Text('Filter Tasks'),
+                    if (localPriorities.isNotEmpty ||
+                        localStatuses.isNotEmpty ||
+                        localProjects.isNotEmpty)
+                      TextButton(
+                        onPressed: () {
+                          setState(() {
+                            localPriorities.clear();
+                            localStatuses.clear();
+                            localProjects.clear();
+                          });
+                          onClearFilters();
+                        },
+                        child: Text(
+                          'Clear All',
+                          style: TextStyle(fontSize: 12),
+                        ),
+                      ),
+                  ],
+                ),
+                content: SingleChildScrollView(
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      // Priority Filter
+                      if (filterOptions['priorities']!.isNotEmpty) ...[
+                        Text(
+                          'Priority',
+                          style: TextStyle(
+                            fontWeight: FontWeight.bold,
+                            fontSize: 16,
+                          ),
+                        ),
+                        SizedBox(height: 8),
+                        Wrap(
+                          spacing: 8,
+                          runSpacing: 8,
+                          children:
+                              filterOptions['priorities']!.map((priority) {
+                            final isSelected =
+                                localPriorities.contains(priority);
+                            return FilterChip(
+                              label: Text(priority),
+                              selected: isSelected,
+                              onSelected: (selected) {
+                                setState(() {
+                                  if (selected) {
+                                    localPriorities.add(priority);
+                                  } else {
+                                    localPriorities.remove(priority);
+                                  }
+                                });
+                              },
+                            );
+                          }).toList(),
+                        ),
+                        SizedBox(height: 16),
+                      ],
+
+                      // Status Filter
+                      if (filterOptions['statuses']!.isNotEmpty) ...[
+                        Text(
+                          'Status',
+                          style: TextStyle(
+                            fontWeight: FontWeight.bold,
+                            fontSize: 16,
+                          ),
+                        ),
+                        SizedBox(height: 8),
+                        Wrap(
+                          spacing: 8,
+                          runSpacing: 8,
+                          children: filterOptions['statuses']!.map((status) {
+                            final isSelected = localStatuses.contains(status);
+                            return FilterChip(
+                              label: Text(status),
+                              selected: isSelected,
+                              onSelected: (selected) {
+                                setState(() {
+                                  if (selected) {
+                                    localStatuses.add(status);
+                                  } else {
+                                    localStatuses.remove(status);
+                                  }
+                                });
+                              },
+                            );
+                          }).toList(),
+                        ),
+                        SizedBox(height: 16),
+                      ],
+
+                      // Project Filter
+                      if (filterOptions['projects']!.isNotEmpty) ...[
+                        Text(
+                          'Project',
+                          style: TextStyle(
+                            fontWeight: FontWeight.bold,
+                            fontSize: 16,
+                          ),
+                        ),
+                        SizedBox(height: 8),
+                        Wrap(
+                          spacing: 8,
+                          runSpacing: 8,
+                          children: filterOptions['projects']!.map((project) {
+                            final isSelected = localProjects.contains(project);
+                            return FilterChip(
+                              label: Text(project),
+                              selected: isSelected,
+                              onSelected: (selected) {
+                                setState(() {
+                                  if (selected) {
+                                    localProjects.add(project);
+                                  } else {
+                                    localProjects.remove(project);
+                                  }
+                                });
+                              },
+                            );
+                          }).toList(),
+                        ),
+                      ],
+                    ],
+                  ),
+                ),
+                actions: [
+                  TextButton(
+                    onPressed: () => Navigator.of(dialogContext).pop(),
+                    child: Text('Cancel'),
+                  ),
+                  TextButton(
+                    onPressed: () {
+                      selectedPriorities.value = localPriorities;
+                      selectedStatuses.value = localStatuses;
+                      selectedProjects.value = localProjects;
+                      onUpdateFilters();
+                      hasActiveFilters.value = localPriorities.isNotEmpty ||
+                          localStatuses.isNotEmpty ||
+                          localProjects.isNotEmpty;
+                      Navigator.of(dialogContext).pop();
+                    },
+                    child: Text('Apply'),
+                  ),
+                ],
+              );
+            },
+          );
+        },
+      );
+    }
+
+    // Build search and filter bar (matching home screen)
+    Widget _buildSearchAndFilterBar(
+        BuildContext context,
+        bool isDesktop,
+        bool isMobile,
+        bool isSmallMobile,
+        ObjectRef<OverlayEntry?> suggestionsOverlayRef,
+        ValueNotifier<bool> isSearchVisible) {
+      // Get suggestions based on current query
+      final suggestions = kanbanViewModel.searchQuery.isNotEmpty
+          ? kanbanViewModel.getSearchSuggestions(searchController.text)
+          : <String>[];
+
+      if (isSmallMobile) {
+        return AnimatedCrossFade(
+          crossFadeState: isSearchVisible.value
+              ? CrossFadeState.showSecond
+              : CrossFadeState.showFirst,
+          duration: const Duration(milliseconds: 300),
+          firstChild: Align(
+            alignment: Alignment.centerRight,
+            child: InkWell(
+              onTap: () => isSearchVisible.value = true,
+              borderRadius: BorderRadius.circular(12),
+              child: Container(
+                padding: const EdgeInsets.all(12),
+                decoration: BoxDecoration(
+                  color: Theme.of(context).cardColor,
+                  borderRadius: BorderRadius.circular(12),
+                  border: Border.all(
+                    color: Theme.of(context).dividerColor.withOpacity(0.1),
+                    width: 1,
+                  ),
+                ),
+                child: Icon(
+                  Icons.search,
+                  color: Theme.of(context).textTheme.bodyMedium?.color,
+                ),
+              ),
+            ),
+          ),
+          secondChild: Column(
+            children: [
+              Row(
+                children: [
+                  Expanded(
+                    child: Container(
+                      key: searchBarKey,
+                      padding: const EdgeInsets.symmetric(
+                          horizontal: 20, vertical: 16),
+                      decoration: BoxDecoration(
+                        color:
+                            Theme.of(context).inputDecorationTheme.fillColor ??
+                                Theme.of(context).cardColor,
+                        borderRadius: BorderRadius.circular(12),
+                        border: Border.all(
+                          color:
+                              Theme.of(context).dividerColor.withOpacity(0.1),
+                          width: 1,
+                        ),
+                      ),
+                      child: Row(
+                        children: [
+                          Icon(
+                            Icons.search,
+                            color: Theme.of(context)
+                                    .textTheme
+                                    .bodyMedium
+                                    ?.color
+                                    ?.withOpacity(0.5) ??
+                                Colors.white.withOpacity(0.5),
+                            size: 24,
+                          ),
+                          const SizedBox(width: 16),
+                          Expanded(
+                            child: TextField(
+                              controller: searchController,
+                              focusNode: searchFocusNode,
+                              onChanged: (value) {
+                                kanbanViewModel.setSearchQuery(value);
+                                final newSuggestions = value.isNotEmpty
+                                    ? kanbanViewModel
+                                        .getSearchSuggestions(value)
+                                    : <String>[];
+                                final shouldShow = value.isNotEmpty &&
+                                    newSuggestions.isNotEmpty;
+
+                                // Manage overlay
+                                suggestionsOverlayRef.value?.remove();
+                                suggestionsOverlayRef.value = null;
+
+                                if (shouldShow) {
+                                  WidgetsBinding.instance
+                                      .addPostFrameCallback((_) {
+                                    if (searchBarKey.currentContext != null) {
+                                      suggestionsOverlayRef.value =
+                                          _showSuggestionsOverlay(
+                                        context,
+                                        searchBarKey,
+                                        newSuggestions,
+                                        searchController,
+                                        searchQuery,
+                                        showSuggestions,
+                                        searchFocusNode,
+                                        isSmallMobile,
+                                      );
+                                    }
+                                  });
+                                }
+
+                                showSuggestions.value = shouldShow;
+                              },
+                              onTap: () {
+                                final currentSuggestions =
+                                    kanbanViewModel.searchQuery.isNotEmpty
+                                        ? kanbanViewModel.getSearchSuggestions(
+                                            searchController.text)
+                                        : <String>[];
+                                if (currentSuggestions.isNotEmpty) {
+                                  showSuggestions.value = true;
+                                  // Show overlay
+                                  suggestionsOverlayRef.value?.remove();
+                                  WidgetsBinding.instance
+                                      .addPostFrameCallback((_) {
+                                    if (searchBarKey.currentContext != null) {
+                                      suggestionsOverlayRef.value =
+                                          _showSuggestionsOverlay(
+                                        context,
+                                        searchBarKey,
+                                        currentSuggestions,
+                                        searchController,
+                                        searchQuery,
+                                        showSuggestions,
+                                        searchFocusNode,
+                                        isSmallMobile,
+                                      );
+                                    }
+                                  });
+                                }
+                              },
+                              onSubmitted: (_) {
+                                showSuggestions.value = false;
+                                suggestionsOverlayRef.value?.remove();
+                                suggestionsOverlayRef.value = null;
+                              },
+                              style: TextStyle(
+                                  color: Theme.of(context)
+                                          .textTheme
+                                          .bodyLarge
+                                          ?.color ??
+                                      Colors.white),
+                              decoration: InputDecoration(
+                                hintText: 'Search tasks...',
+                                hintStyle: TextStyle(
+                                  color: Theme.of(context)
+                                          .textTheme
+                                          .bodyMedium
+                                          ?.color
+                                          ?.withOpacity(0.5) ??
+                                      Colors.white.withOpacity(0.5),
+                                  fontSize: 16,
+                                ),
+                                border: InputBorder.none,
+                                contentPadding: EdgeInsets.zero,
+                              ),
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  InkWell(
+                    onTap: () {
+                      isSearchVisible.value = false;
+                      searchFocusNode.unfocus();
+                      suggestionsOverlayRef.value?.remove();
+                      suggestionsOverlayRef.value = null;
+                    },
+                    borderRadius: BorderRadius.circular(12),
+                    child: Container(
+                      padding: const EdgeInsets.all(16),
+                      decoration: BoxDecoration(
+                        color: Theme.of(context).cardColor,
+                        borderRadius: BorderRadius.circular(12),
+                        border: Border.all(
+                          color:
+                              Theme.of(context).dividerColor.withOpacity(0.1),
+                          width: 1,
+                        ),
+                      ),
+                      child: Icon(
+                        Icons.close,
+                        color: Theme.of(context).textTheme.bodyMedium?.color,
+                        size: 24,
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+              // Suggestions dropdown for small mobile
+              if (showSuggestions.value && suggestions.isNotEmpty)
+                Container(
+                  margin: EdgeInsets.only(top: 4),
+                  constraints: BoxConstraints(
+                    maxHeight: 200,
+                  ),
+                  decoration: BoxDecoration(
+                    color: Theme.of(context).cardColor,
+                    borderRadius: BorderRadius.circular(12),
+                    border: Border.all(
+                      color: Theme.of(context).dividerColor.withOpacity(0.2),
+                      width: 1,
+                    ),
+                    boxShadow: [
+                      BoxShadow(
+                        color: Colors.black.withOpacity(0.1),
+                        blurRadius: 8,
+                        offset: Offset(0, 4),
+                      ),
+                    ],
+                  ),
+                  child: ListView.builder(
+                    shrinkWrap: true,
+                    itemCount: suggestions.length,
+                    itemBuilder: (context, index) {
+                      final suggestion = suggestions[index];
+                      return InkWell(
+                        onTap: () {
+                          searchController.text = suggestion;
+                          searchQuery.value = suggestion;
+                          showSuggestions.value = false;
+                          searchFocusNode.unfocus();
+                        },
+                        child: Container(
+                          padding: EdgeInsets.symmetric(
+                              horizontal: 20, vertical: 12),
+                          child: Row(
+                            children: [
+                              Icon(
+                                Icons.search,
+                                size: 18,
+                                color: Theme.of(context)
+                                    .textTheme
+                                    .bodyMedium
+                                    ?.color
+                                    ?.withOpacity(0.6),
+                              ),
+                              SizedBox(width: 12),
+                              Expanded(
+                                child: Text(
+                                  suggestion,
+                                  style: TextStyle(
+                                    color: Theme.of(context)
+                                        .textTheme
+                                        .bodyLarge
+                                        ?.color,
+                                    fontSize: 14,
+                                  ),
+                                ),
+                              ),
+                            ],
+                          ),
+                        ),
+                      );
+                    },
+                  ),
+                ),
+              const SizedBox(height: 12),
+              InkWell(
+                onTap: () {
+                  final filterOptions = kanbanViewModel.getFilterOptions();
+                  _showFilterDialog(
+                    context,
+                    selectedPriorities,
+                    selectedStatuses,
+                    selectedProjects,
+                    filterOptions,
+                    () {
+                      kanbanViewModel.clearFilters();
+                      // No longer needed - handled by ViewModel;
+                    },
+                    // No longer needed
+                    hasActiveFilters,
+                  );
+                },
+                child: Container(
+                  width: double.infinity,
+                  padding:
+                      const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
+                  decoration: BoxDecoration(
+                    color: Theme.of(context).inputDecorationTheme.fillColor ??
+                        Theme.of(context).cardColor,
+                    borderRadius: BorderRadius.circular(16),
+                    border: Border.all(
+                      color: Theme.of(context).dividerColor.withOpacity(0.1),
+                      width: 1,
+                    ),
+                  ),
+                  child: Row(
+                    mainAxisAlignment: MainAxisAlignment.center,
+                    children: [
+                      Stack(
+                        children: [
+                          Icon(
+                            Icons.filter_list,
+                            color: Theme.of(context)
+                                    .textTheme
+                                    .bodyMedium
+                                    ?.color
+                                    ?.withOpacity(0.7) ??
+                                Colors.white.withOpacity(0.7),
+                            size: 22,
+                          ),
+                          if (hasActiveFilters.value)
+                            Positioned(
+                              right: -2,
+                              top: -2,
+                              child: Container(
+                                width: 8,
+                                height: 8,
+                                decoration: BoxDecoration(
+                                  color: Theme.of(context).colorScheme.error,
+                                  shape: BoxShape.circle,
+                                ),
+                              ),
+                            ),
+                        ],
+                      ),
+                      const SizedBox(width: 8),
+                      Text(
+                        'Filter Tasks${hasActiveFilters.value ? ' (${selectedPriorities.value.length + selectedStatuses.value.length + selectedProjects.value.length})' : ''}',
+                        style: TextStyle(
+                          color: Theme.of(context)
+                                  .textTheme
+                                  .bodyMedium
+                                  ?.color
+                                  ?.withOpacity(0.7) ??
+                              Colors.white.withOpacity(0.7),
+                          fontSize: 14,
+                          fontWeight: FontWeight.w600,
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            ],
+          ),
+        );
+      } else {
+        return AnimatedCrossFade(
+          crossFadeState: isSearchVisible.value
+              ? CrossFadeState.showSecond
+              : CrossFadeState.showFirst,
+          duration: const Duration(milliseconds: 300),
+          firstChild: Align(
+            alignment: Alignment.centerRight,
+            child: InkWell(
+              onTap: () => isSearchVisible.value = true,
+              borderRadius: BorderRadius.circular(12),
+              child: Container(
+                padding: const EdgeInsets.all(12),
+                decoration: BoxDecoration(
+                  color: Theme.of(context).cardColor,
+                  borderRadius: BorderRadius.circular(12),
+                  border: Border.all(
+                    color: Theme.of(context).dividerColor.withOpacity(0.1),
+                    width: 1,
+                  ),
+                ),
+                child: Icon(
+                  Icons.search,
+                  color: Theme.of(context).textTheme.bodyMedium?.color,
+                ),
+              ),
+            ),
+          ),
+          secondChild: Row(
+            children: [
+              Expanded(
+                child: Stack(
+                  clipBehavior: Clip.none,
+                  children: [
+                    Container(
+                      key: searchBarKey,
+                      padding: const EdgeInsets.symmetric(
+                          horizontal: 16, vertical: 12),
+                      decoration: BoxDecoration(
+                        color:
+                            Theme.of(context).inputDecorationTheme.fillColor ??
+                                Theme.of(context).cardColor,
+                        borderRadius: BorderRadius.circular(12),
+                        border: Border.all(
+                          color:
+                              Theme.of(context).dividerColor.withOpacity(0.1),
+                          width: 1,
+                        ),
+                      ),
+                      child: Row(
+                        children: [
+                          Icon(
+                            Icons.search,
+                            color: Theme.of(context)
+                                    .textTheme
+                                    .bodyMedium
+                                    ?.color
+                                    ?.withOpacity(0.5) ??
+                                Colors.white.withOpacity(0.5),
+                            size: 20,
+                          ),
+                          const SizedBox(width: 12),
+                          Expanded(
+                            child: TextField(
+                              controller: searchController,
+                              focusNode: searchFocusNode,
+                              onChanged: (value) {
+                                kanbanViewModel.setSearchQuery(value);
+                                final newSuggestions = value.isNotEmpty
+                                    ? kanbanViewModel
+                                        .getSearchSuggestions(value)
+                                    : <String>[];
+                                final shouldShow = value.isNotEmpty &&
+                                    newSuggestions.isNotEmpty;
+
+                                // Manage overlay
+                                suggestionsOverlayRef.value?.remove();
+                                suggestionsOverlayRef.value = null;
+
+                                if (shouldShow) {
+                                  WidgetsBinding.instance
+                                      .addPostFrameCallback((_) {
+                                    if (searchBarKey.currentContext != null) {
+                                      suggestionsOverlayRef.value =
+                                          _showSuggestionsOverlay(
+                                        context,
+                                        searchBarKey,
+                                        newSuggestions,
+                                        searchController,
+                                        searchQuery,
+                                        showSuggestions,
+                                        searchFocusNode,
+                                        isSmallMobile,
+                                      );
+                                    }
+                                  });
+                                }
+
+                                showSuggestions.value = shouldShow;
+                              },
+                              onTap: () {
+                                final currentSuggestions =
+                                    kanbanViewModel.searchQuery.isNotEmpty
+                                        ? kanbanViewModel.getSearchSuggestions(
+                                            searchController.text)
+                                        : <String>[];
+                                if (currentSuggestions.isNotEmpty) {
+                                  showSuggestions.value = true;
+                                  // Show overlay
+                                  suggestionsOverlayRef.value?.remove();
+                                  WidgetsBinding.instance
+                                      .addPostFrameCallback((_) {
+                                    if (searchBarKey.currentContext != null) {
+                                      suggestionsOverlayRef.value =
+                                          _showSuggestionsOverlay(
+                                        context,
+                                        searchBarKey,
+                                        currentSuggestions,
+                                        searchController,
+                                        searchQuery,
+                                        showSuggestions,
+                                        searchFocusNode,
+                                        isSmallMobile,
+                                      );
+                                    }
+                                  });
+                                }
+                              },
+                              onSubmitted: (_) {
+                                showSuggestions.value = false;
+                                suggestionsOverlayRef.value?.remove();
+                                suggestionsOverlayRef.value = null;
+                              },
+                              style: TextStyle(
+                                  color: Theme.of(context)
+                                          .textTheme
+                                          .bodyLarge
+                                          ?.color ??
+                                      Colors.white),
+                              decoration: InputDecoration(
+                                hintText:
+                                    'Search tasks, assignees, or descriptions...',
+                                hintStyle: TextStyle(
+                                  color: Theme.of(context)
+                                          .textTheme
+                                          .bodyMedium
+                                          ?.color
+                                          ?.withOpacity(0.5) ??
+                                      Colors.white.withOpacity(0.5),
+                                  fontSize: 14,
+                                ),
+                                border: InputBorder.none,
+                                contentPadding: EdgeInsets.zero,
+                              ),
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+              const SizedBox(width: 12),
+              InkWell(
+                onTap: () {
+                  final filterOptions = kanbanViewModel.getFilterOptions();
+                  _showFilterDialog(
+                    context,
+                    selectedPriorities,
+                    selectedStatuses,
+                    selectedProjects,
+                    filterOptions,
+                    () {
+                      kanbanViewModel.clearFilters();
+                      // No longer needed - handled by ViewModel;
+                    },
+                    // No longer needed
+                    hasActiveFilters,
+                  );
+                },
+                child: Container(
+                  padding:
+                      const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+                  decoration: BoxDecoration(
+                    color: Theme.of(context).inputDecorationTheme.fillColor ??
+                        Theme.of(context).cardColor,
+                    borderRadius: BorderRadius.circular(12),
+                    border: Border.all(
+                      color: Theme.of(context).dividerColor.withOpacity(0.1),
+                      width: 1,
+                    ),
+                  ),
+                  child: Stack(
+                    children: [
+                      Icon(
+                        Icons.filter_list,
+                        color: Theme.of(context)
+                                .textTheme
+                                .bodyMedium
+                                ?.color
+                                ?.withOpacity(0.7) ??
+                            Colors.white.withOpacity(0.7),
+                        size: 20,
+                      ),
+                      if (hasActiveFilters.value)
+                        Positioned(
+                          right: 0,
+                          top: 0,
+                          child: Container(
+                            width: 8,
+                            height: 8,
+                            decoration: BoxDecoration(
+                              color: Theme.of(context).colorScheme.error,
+                              shape: BoxShape.circle,
+                            ),
+                          ),
+                        ),
+                    ],
+                  ),
+                ),
+              ),
+              const SizedBox(width: 8),
+              InkWell(
+                onTap: () {
+                  isSearchVisible.value = false;
+                  searchFocusNode.unfocus();
+                  suggestionsOverlayRef.value?.remove();
+                  suggestionsOverlayRef.value = null;
+                },
+                borderRadius: BorderRadius.circular(12),
+                child: Container(
+                  padding: const EdgeInsets.all(12),
+                  decoration: BoxDecoration(
+                    color: Theme.of(context).cardColor,
+                    borderRadius: BorderRadius.circular(12),
+                    border: Border.all(
+                      color: Theme.of(context).dividerColor.withOpacity(0.1),
+                      width: 1,
+                    ),
+                  ),
+                  child: Icon(
+                    Icons.close,
+                    color: Theme.of(context).textTheme.bodyMedium?.color,
+                    size: 20,
+                  ),
+                ),
+              ),
+            ],
+          ),
+        );
+      }
+    }
+
+    // Helper methods for date and time formatting
+    String _formatDate(DateTime date) {
+      return '${date.day}/${date.month}/${date.year}';
+    }
+
+    String _getDateRange(Task task) {
+      if (task.assignedAt != null && task.devCompletedAt != null) {
+        return '${_formatDate(task.assignedAt!)} - ${_formatDate(task.devCompletedAt!)}';
+      } else if (task.assignedAt != null) {
+        return 'Assigned: ${_formatDate(task.assignedAt!)}';
+      } else if (task.devCompletedAt != null) {
+        return 'Due: ${_formatDate(task.devCompletedAt!)}';
+      } else {
+        return 'N/A';
+      }
+    }
+
+    String _getTaskDuration(Task task) {
+      // Use task_duration field from the task
+      if (task.taskDuration != null && task.taskDuration!.isNotEmpty) {
+        return task.taskDuration!;
+      }
+
+      // Fallback: calculate duration from total dev hours if available
+      if (task.totalDevHours != null && task.totalDevHours! > 0) {
+        final hours = task.totalDevHours!;
+        if (hours >= 24) {
+          final days = hours ~/ 24;
+          final remainingHours = hours % 24;
+          return remainingHours > 0
+              ? '$days days $remainingHours hours'
+              : '$days days';
+        } else {
+          return '$hours hours';
+        }
+      }
+
+      return 'N/A';
+    }
+
+    // Helper function to get status description
+    String _getStatusDescription(KanbanTaskStatus status) {
+      switch (status) {
+        case KanbanTaskStatus.todo:
+          return 'To Do';
+        case KanbanTaskStatus.inProgress:
+          return 'In Progress';
+        case KanbanTaskStatus.devcompleted:
+          return 'Dev Completed';
+        case KanbanTaskStatus.inQc:
+          return 'In QC';
+        case KanbanTaskStatus.workDone:
+          return 'Work Done';
+        case KanbanTaskStatus.redo:
+          return 'Redo';
+      }
+    }
+
+    // Update task status when moved between columns
+    Future<void> updateTaskStatus(Task task, KanbanTaskStatus newStatus) async {
+      try {
+        // Convert KanbanTaskStatus to TaskViewModel TaskStatus
+        TaskStatus taskViewModelStatus;
+        String newWorkflowStatus;
+
+        switch (newStatus) {
+          case KanbanTaskStatus.todo:
+            taskViewModelStatus = TaskStatus.assigned;
+            newWorkflowStatus = 'Assigned';
+            break;
+          case KanbanTaskStatus.inProgress:
+            taskViewModelStatus = TaskStatus.inProgress;
+            newWorkflowStatus = 'In Progress';
+            break;
+          case KanbanTaskStatus.devcompleted:
+            taskViewModelStatus = TaskStatus.devCompleted;
+            newWorkflowStatus = 'Dev Completed';
+            break;
+          case KanbanTaskStatus.inQc:
+            taskViewModelStatus = TaskStatus.inQc;
+            newWorkflowStatus = 'In QC';
+            break;
+          case KanbanTaskStatus.workDone:
+            taskViewModelStatus = TaskStatus.workDone;
+            newWorkflowStatus = 'Work Done';
+            break;
+          case KanbanTaskStatus.redo:
+            taskViewModelStatus = TaskStatus.redo;
+            newWorkflowStatus = 'Redo';
+            break;
+        }
+
+        // Update task status using TaskViewModel
+        final success = await taskViewModel.updateTaskStatus(
+          taskId: task.taskId,
+          status: taskViewModelStatus,
+        );
+
+        if (success) {
+          // Log the task status change action
+          final logService = TaskCardLogService();
+          final statusDescription = _getStatusDescription(newStatus);
+          await logService.logTaskAction(
+            taskId: task.taskId,
+            actionName: 'Status Changed',
+            actionDescription:
+                'Task "${task.taskName}" status changed to "$statusDescription" via Kanban board',
+          );
+
+          // Update local state
+          final updatedTasks = tasks.value.map((t) {
+            if (t.taskId == task.taskId) {
+              // Update the specific task
+              return Task(
+                taskId: t.taskId,
+                employeeId: t.employeeId,
+                projectId: t.projectId,
+                taskName: t.taskName,
+                taskDescription: t.taskDescription,
+                taskDuration: t.taskDuration,
+                taskType: t.taskType,
+                priorityLevel: t.priorityLevel,
+                workflowStatus: newWorkflowStatus,
+                assignedAt: t.assignedAt,
+                devStartedAt: t.devStartedAt,
+                devCompletedAt: t.devCompletedAt,
+                totalDevHours: t.totalDevHours,
+                devNotes: t.devNotes,
+                devCompletedAttachments: t.devCompletedAttachments,
+                qcStartedAt: t.qcStartedAt,
+                qcCompletedAt: t.qcCompletedAt,
+                qcTotalHours: t.qcTotalHours,
+                qcNotes: t.qcNotes,
+                qcCompletedAttachments: t.qcCompletedAttachments,
+                taskAttachments: t.taskAttachments,
+                createdBy: t.createdBy,
+                createdAt: t.createdAt,
+                updatedBy: t.updatedBy,
+                updatedAt: t.updatedAt,
+                statusReason: t.statusReason,
+                projectDetails: t.projectDetails,
+                employeeDetails: t.employeeDetails,
+              );
+            }
+            return t;
+          }).toList();
+
+          tasks.value = updatedTasks;
+
+          print('✅ Task ${task.taskName} moved to ${newStatus.name}');
+        } else {
+          print('❌ Failed to update task status in database');
+        }
+      } catch (e) {
+        print('❌ Error updating task status: $e');
+      }
+    }
+
+    // Action methods
+    Future<void> _startTask(Task task) async {
+      try {
+        print('🚀 Auto-starting task: ${task.taskName}');
+        // Use TaskViewModel to start the task
+        final success = await taskViewModel.startTask(taskId: task.taskId);
+        if (success) {
+          // Refresh tasks after starting
+          await _loadTasks();
+          print(
+              '✅ Task ${task.taskName} started successfully via drag-and-drop');
+        } else {
+          print('❌ Failed to start task ${task.taskName}');
+        }
+      } catch (e) {
+        print('❌ Error starting task: $e');
+      }
+    }
+
+    // Build action button based on task status
+    Widget _buildActionButton(Task task, KanbanTaskStatus status) {
+      switch (status) {
+        case KanbanTaskStatus.todo:
+          // No action button for TODO - drag to In Progress to start
+          return const SizedBox.shrink();
+        case KanbanTaskStatus.inProgress:
+          // No action button for In Progress - just drag to move
+          return const SizedBox.shrink();
+        case KanbanTaskStatus.devcompleted:
+          // No action button for Completed - just drag to move
+          return const SizedBox.shrink();
+        case KanbanTaskStatus.inQc:
+          // No action button for In QC - just drag to move
+          return const SizedBox.shrink();
+        case KanbanTaskStatus.workDone:
+          // No action button for Work Done - just drag to move
+          return const SizedBox.shrink();
+        case KanbanTaskStatus.redo:
+          // No action button for Redo - just drag to move
+          return const SizedBox.shrink();
+      }
+    }
+
+    // Build task card content matching existing design
+    Widget _buildTaskCardContent(Task task, KanbanTaskStatus status,
+        {bool isDragging = false}) {
+      // Get status color and text
+      Color statusColor;
+      String statusText;
+
+      switch (status) {
+        case KanbanTaskStatus.todo:
+          statusColor = ThemeColors.warning;
+          statusText = 'Pending';
+          break;
+        case KanbanTaskStatus.inProgress:
+          statusColor = ThemeColors.info;
+          statusText = 'In Progress';
+          break;
+        case KanbanTaskStatus.devcompleted:
+          statusColor = ThemeColors.success;
+          statusText = 'Dev Completed';
+          break;
+        case KanbanTaskStatus.inQc:
+          statusColor = const Color(0xFF8B5CF6); // Purple
+          statusText = 'In QC';
+          break;
+        case KanbanTaskStatus.workDone:
+          statusColor = const Color(0xFF10B981); // Green
+          statusText = 'Work Done';
+          break;
+        case KanbanTaskStatus.redo:
+          statusColor = Theme.of(context).colorScheme.error; // Red
+          statusText = 'Redo';
+          break;
+      }
+
+      // Get priority color and text
+      Color priorityColor;
+      String priorityText;
+
+      // Handle different priority level formats (string, number, etc.)
+      final priorityLevel = task.priorityLevel?.toString().toLowerCase() ?? '';
+
+      // Debug logging to see actual priority level values
+      print(
+          '🔍 Priority Level Debug - Task: ${task.taskName}, Raw: ${task.priorityLevel}, Processed: $priorityLevel');
+
+      switch (priorityLevel) {
+        case 'high':
+        case '1':
+        case 'urgent':
+        case 'critical':
+          priorityColor = Theme.of(context).colorScheme.error;
+          priorityText = 'High';
+          break;
+        case 'medium':
+        case '2':
+        case 'normal':
+        case 'standard':
+          priorityColor = ThemeColors.warning;
+          priorityText = 'Medium';
+          break;
+        case 'low':
+        case '3':
+        case 'minor':
+        case 'lowest':
+          priorityColor = ThemeColors.success;
+          priorityText = 'Low';
+          break;
+        default:
+          priorityColor = ThemeColors.success;
+          priorityText = 'Low';
+          break;
+      }
+
+      return Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          // Task title
+          Text(
+            task.taskName ?? 'Untitled Task',
+            style: TextStyle(
+              fontSize: isDesktop ? 14 : 12,
+              fontWeight: FontWeight.bold,
+              color: isDragging
+                  ? Theme.of(context).textTheme.bodySmall?.color ?? Colors.grey
+                  : Theme.of(context).textTheme.titleMedium?.color ??
+                      Colors.black,
+            ),
+            maxLines: 2,
+            overflow: TextOverflow.ellipsis,
+          ),
+
+          const SizedBox(height: 8),
+
+          // Tags row
+          Row(
+            children: [
+              // Status tag
+              Container(
+                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                decoration: BoxDecoration(
+                  color: statusColor.withOpacity(0.1),
+                  borderRadius: BorderRadius.circular(8),
+                ),
+                child: Text(
+                  statusText,
+                  style: TextStyle(
+                    color: statusColor,
+                    fontSize: 10,
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+              ),
+              const SizedBox(width: 6),
+              // Priority tag
+              Container(
+                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                decoration: BoxDecoration(
+                  color: priorityColor.withOpacity(0.1),
+                  borderRadius: BorderRadius.circular(8),
+                ),
+                child: Text(
+                  priorityText,
+                  style: TextStyle(
+                    color: priorityColor,
+                    fontSize: 10,
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+              ),
+            ],
+          ),
+
+          const SizedBox(height: 8),
+
+          // Task description
+          if (task.taskDescription?.isNotEmpty == true) ...[
+            Text(
+              task.taskDescription!,
+              style: TextStyle(
+                color:
+                    Theme.of(context).textTheme.bodySmall?.color ?? Colors.grey,
+                fontSize: 11,
+                fontWeight: FontWeight.w500,
+                height: 1.3,
+              ),
+              maxLines: 2,
+              overflow: TextOverflow.ellipsis,
+            ),
+            const SizedBox(height: 8),
+          ],
+
+          // Date and time row
+          Row(
+            children: [
+              // Date
+              Expanded(
+                child: Row(
+                  children: [
+                    Icon(
+                      Icons.calendar_today,
+                      size: 12,
+                      color: Theme.of(context).textTheme.bodySmall?.color ??
+                          Colors.grey,
+                    ),
+                    const SizedBox(width: 4),
+                    Text(
+                      _getDateRange(task),
+                      style: TextStyle(
+                        color: Theme.of(context).textTheme.bodySmall?.color ??
+                            Colors.grey,
+                        fontSize: 10,
+                        fontWeight: FontWeight.w500,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+              // Time remaining
+              Row(
+                children: [
+                  Icon(
+                    Icons.access_time,
+                    size: 12,
+                    color: ThemeColors.info,
+                  ),
+                  const SizedBox(width: 4),
+                  Text(
+                    _getTaskDuration(task),
+                    style: TextStyle(
+                      color: ThemeColors.info,
+                      fontSize: 10,
+                      fontWeight: FontWeight.w600,
+                    ),
+                  ),
+                ],
+              ),
+            ],
+          ),
+
+          const SizedBox(height: 12),
+
+          // View Details button - small and premium
+          if (!isDragging)
+            MouseRegion(
+              cursor: SystemMouseCursors.click,
+              child: InkWell(
+                onTap: () => showTaskDetailsDialog(context, task),
+                borderRadius: BorderRadius.circular(8),
+                child: Container(
+                  padding:
+                      const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+                  decoration: BoxDecoration(
+                    color: Theme.of(context).brightness == Brightness.dark
+                        ? Theme.of(context).primaryColor.withOpacity(0.2)
+                        : Theme.of(context).primaryColor.withOpacity(0.1),
+                    gradient: LinearGradient(
+                      colors: [
+                        Theme.of(context).primaryColor.withOpacity(0.25),
+                        Theme.of(context).primaryColor.withOpacity(0.1),
+                      ],
+                    ),
+                    borderRadius: BorderRadius.circular(8),
+                    border: Border.all(
+                      color: Theme.of(context).primaryColor.withOpacity(0.6),
+                      width: 1.5,
+                    ),
+                  ),
+                  child: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    mainAxisAlignment: MainAxisAlignment.center,
+                    children: [
+                      Icon(
+                        Icons.info_outline,
+                        size: 14,
+                        color: Theme.of(context).primaryColor,
+                      ),
+                      const SizedBox(width: 6),
+                      Text(
+                        'View Details',
+                        style: TextStyle(
+                          fontSize: 12,
+                          fontWeight: FontWeight.w600,
+                          color: Theme.of(context).primaryColor,
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            ),
+
+          const SizedBox(height: 8),
+
+          // Action button based on status
+          if (!isDragging) _buildActionButton(task, status),
+
+          // Show drag hint for TODO tasks
+          if (!isDragging && status == KanbanTaskStatus.todo) ...[
+            const SizedBox(height: 8),
+            Row(
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: [
+                Icon(
+                  Icons.drag_indicator,
+                  size: 16,
+                  color: Theme.of(context).textTheme.bodySmall?.color ??
+                      Colors.grey,
+                ),
+                const SizedBox(width: 4),
+                Text(
+                  'Drag to In Progress to start',
+                  style: TextStyle(
+                    color: Theme.of(context).textTheme.bodySmall?.color ??
+                        Colors.grey,
+                    fontSize: 10,
+                    fontStyle: FontStyle.italic,
+                  ),
+                ),
+              ],
+            ),
+          ],
+        ],
+      );
+    }
+
+    // Build task card matching existing design
+    Widget buildTaskCard(Task task, KanbanTaskStatus status) {
+      return Draggable<Task>(
+        data: task,
+        onDragStarted: _onDragStarted,
+        onDragEnd: (details) => _onDragEnd(),
+        onDragUpdate: (details) => _updateDragPosition(details.globalPosition),
+        feedback: Material(
+          elevation: 16,
+          borderRadius: BorderRadius.circular(16),
+          color: Colors.transparent,
+          child: Transform.rotate(
+            angle: 0.05, // Slight rotation (approx 3 degrees)
+            child: Transform.scale(
+              scale: 1.05,
+              child: Container(
+                width: MediaQuery.of(context).size.width < 600
+                    ? 200
+                    : (MediaQuery.of(context).size.width < 900 ? 250 : 300),
+                padding: const EdgeInsets.all(16),
+                decoration: BoxDecoration(
+                  color: Theme.of(context).cardTheme.color,
+                  borderRadius: BorderRadius.circular(16),
+                  boxShadow: [
+                    BoxShadow(
+                      color: ThemeColors.shadowColor(context).withOpacity(0.4),
+                      blurRadius: 30,
+                      offset: const Offset(0, 15),
+                    ),
+                  ],
+                  border: Border.all(
+                    color: Theme.of(context).primaryColor.withOpacity(0.5),
+                    width: 2,
+                  ),
+                ),
+                child: _buildTaskCardContent(task, status, isDragging: true),
+              ),
+            ),
+          ),
+        ),
+        childWhenDragging: Container(
+          padding: const EdgeInsets.all(16),
+          decoration: BoxDecoration(
+            color: (Theme.of(context).textTheme.bodySmall?.color ?? Colors.grey)
+                .withOpacity(0.1),
+            borderRadius: BorderRadius.circular(16),
+          ),
+          child: _buildTaskCardContent(task, status, isDragging: true),
+        ),
+        child: MouseRegion(
+          cursor: SystemMouseCursors.click,
+          child: AnimatedContainer(
+            duration: const Duration(milliseconds: 200),
+            curve: Curves.easeInOut,
+            key: ValueKey(task.taskId),
+            padding: const EdgeInsets.all(16),
+            decoration: BoxDecoration(
+              color: Theme.of(context).cardTheme.color,
+              borderRadius: BorderRadius.circular(16),
+              boxShadow: [
+                BoxShadow(
+                  color: ThemeColors.shadowColor(context).withOpacity(0.3),
+                  blurRadius: 12,
+                  offset: const Offset(0, 2),
+                  spreadRadius: 0,
+                ),
+                BoxShadow(
+                  color: ThemeColors.shadowColor(context).withOpacity(0.1),
+                  blurRadius: 24,
+                  offset: const Offset(0, 8),
+                  spreadRadius: 0,
+                ),
+              ],
+              // Add subtle border when auto-scrolling is active
+              border: isDragging.value
+                  ? Border.all(
+                      color: Theme.of(context).primaryColor.withOpacity(0.3),
+                      width: 1,
+                    )
+                  : null,
+            ),
+            child: _buildTaskCardContent(task, status),
+          ),
+        ),
+      );
+    }
+
+    // Build column with drop functionality and locked visual positions
+    Widget buildColumn(KanbanTaskStatus status, String title, Color color) {
+      print('🏗️ Building column: $title (${status.name})');
+
+      // Get filtered tasks
+      final allTasks = kanbanViewModel.filteredTasks;
+
+      // Filter tasks that belong to this column only
+      final columnTasks = allTasks.where((task) {
+        final workflowStatus = task.workflowStatus?.toLowerCase() ?? '';
+
+        switch (status) {
+          case KanbanTaskStatus.todo:
+            return workflowStatus == 'assigned' ||
+                workflowStatus == 'pending' ||
+                workflowStatus == 'todo';
+          case KanbanTaskStatus.inProgress:
+            return workflowStatus == 'in progress' ||
+                workflowStatus == 'in_progress' ||
+                workflowStatus == 'inprogress';
+          case KanbanTaskStatus.devcompleted:
+            return workflowStatus == 'dev completed' ||
+                workflowStatus == 'devcompleted';
+          case KanbanTaskStatus.inQc:
+            return workflowStatus == 'in qc' ||
+                workflowStatus == 'in_qc' ||
+                workflowStatus == 'inqc';
+          case KanbanTaskStatus.workDone:
+            return workflowStatus == 'work done' ||
+                workflowStatus == 'workdone' ||
+                workflowStatus == 'work_done';
+          case KanbanTaskStatus.redo:
+            return workflowStatus == 'redo';
+        }
+      }).toList();
+
+      print('📋 Column $title: ${columnTasks.length} tasks');
+
+      // Build task widgets (no placeholders)
+      final taskWidgets = columnTasks
+          .map((task) => Container(
+                key: ValueKey(task.taskId),
+                child: buildTaskCard(task, status),
+              ))
+          .toList();
+
+      return DragTarget<Task>(
+        onWillAccept: (data) {
+          // Allow dropping if the task is not already in this column
+          if (data == null) return false;
+
+          // Check if task is already in this column
+          final workflowStatus = data.workflowStatus?.toLowerCase() ?? '';
+          bool alreadyInColumn = false;
+          switch (status) {
+            case KanbanTaskStatus.todo:
+              alreadyInColumn = workflowStatus == 'assigned' ||
+                  workflowStatus == 'pending' ||
+                  workflowStatus == 'todo';
+              break;
+            case KanbanTaskStatus.inProgress:
+              alreadyInColumn = workflowStatus == 'in progress' ||
+                  workflowStatus == 'in_progress' ||
+                  workflowStatus == 'inprogress';
+              break;
+            case KanbanTaskStatus.devcompleted:
+              alreadyInColumn = workflowStatus == 'dev completed' ||
+                  workflowStatus == 'devcompleted';
+              break;
+            case KanbanTaskStatus.inQc:
+              alreadyInColumn = workflowStatus == 'in qc' ||
+                  workflowStatus == 'in_qc' ||
+                  workflowStatus == 'inqc';
+              break;
+            case KanbanTaskStatus.workDone:
+              alreadyInColumn = workflowStatus == 'work done' ||
+                  workflowStatus == 'workdone' ||
+                  workflowStatus == 'work_done';
+              break;
+            case KanbanTaskStatus.redo:
+              alreadyInColumn = workflowStatus == 'redo';
+              break;
+          }
+
+          return !alreadyInColumn;
+        },
+        onAccept: (data) async {
+          // Update task status when dropped
+          await updateTaskStatus(data, status);
+
+          // Show celebration for Dev Completed and Work Done
+          if (status == KanbanTaskStatus.devcompleted ||
+              status == KanbanTaskStatus.workDone) {
+            if (context.mounted) {
+              showCongratulationsOverlay(
+                context,
+                taskName: data.taskName ?? 'Task',
+                onComplete: () {
+                  // Refresh tasks after celebration
+                  _loadTasks();
+                },
+              );
+            }
+          }
+
+          // If moving to In Progress, automatically start the task
+          if (status == KanbanTaskStatus.inProgress) {
+            _startTask(data);
+          }
+        },
+        builder: (context, candidateData, rejectedData) {
+          final isAccepting = candidateData.isNotEmpty;
+
+          return AnimatedContainer(
+            duration: const Duration(milliseconds: 200),
+            curve: Curves.easeInOut,
+            margin: EdgeInsets.symmetric(horizontal: isDesktop ? 8 : 4),
+            decoration: BoxDecoration(
+              color: isAccepting ? color.withOpacity(0.1) : Colors.transparent,
+              borderRadius: BorderRadius.circular(16),
+              border: isAccepting
+                  ? Border.all(color: color.withOpacity(0.5), width: 2)
+                  : Border.all(color: Colors.transparent, width: 2),
+              boxShadow: isAccepting
+                  ? [
+                      BoxShadow(
+                        color: color.withOpacity(0.2),
+                        blurRadius: 12,
+                        spreadRadius: 2,
+                      )
+                    ]
+                  : [],
+            ),
+            child: Column(
+              children: [
+                // Column header with premium design
+                Container(
+                  padding:
+                      const EdgeInsets.symmetric(horizontal: 20, vertical: 16),
+                  decoration: BoxDecoration(
+                    gradient: LinearGradient(
+                      begin: Alignment.topLeft,
+                      end: Alignment.bottomRight,
+                      colors: [
+                        color,
+                        color.withOpacity(0.8),
+                      ],
+                    ),
+                    borderRadius: BorderRadius.circular(16),
+                    boxShadow: [
+                      BoxShadow(
+                        color: color.withOpacity(0.3),
+                        blurRadius: 16,
+                        offset: const Offset(0, 6),
+                        spreadRadius: 0,
+                      ),
+                      BoxShadow(
+                        color: color.withOpacity(0.15),
+                        blurRadius: 32,
+                        offset: const Offset(0, 12),
+                        spreadRadius: 0,
+                      ),
+                    ],
+                  ),
+                  child: Row(
+                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                    children: [
+                      customTextWithClip(
+                        text: title,
+                        textColor: Colors.white,
+                        fontSize: isDesktop ? 16 : 14,
+                        fontWeight: FontWeight.bold,
+                      ),
+                      Container(
+                        padding: const EdgeInsets.symmetric(
+                            horizontal: 12, vertical: 6),
+                        decoration: BoxDecoration(
+                          color: Colors.white.withOpacity(0.25),
+                          borderRadius: BorderRadius.circular(20),
+                          border: Border.all(
+                            color: Colors.white.withOpacity(0.3),
+                            width: 1,
+                          ),
+                          boxShadow: [
+                            BoxShadow(
+                              color: Colors.black.withOpacity(0.1),
+                              blurRadius: 8,
+                              offset: const Offset(0, 2),
+                            ),
+                          ],
+                        ),
+                        child: customTextWithClip(
+                          text:
+                              '${kanbanViewModel.getTaskCountForStatus(status.name.toLowerCase())}',
+                          textColor: Colors.white,
+                          fontSize: isDesktop ? 14 : 12,
+                          fontWeight: FontWeight.bold,
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+                // Tasks list with proper height constraint for vertical scrolling
+                SizedBox(
+                  height: MediaQuery.of(context).size.height *
+                      0.7, // 70% of screen height
+                  child: Padding(
+                    padding: const EdgeInsets.only(top: 8),
+                    child: kanbanViewModel.getTaskCountForStatus(
+                                status.name.toLowerCase()) ==
+                            0
+                        ? Center(
+                            child: Column(
+                              mainAxisAlignment: MainAxisAlignment.center,
+                              children: [
+                                Container(
+                                  padding: const EdgeInsets.all(20),
+                                  decoration: BoxDecoration(
+                                    color: color.withOpacity(0.05),
+                                    borderRadius: BorderRadius.circular(16),
+                                    border: Border.all(
+                                      color: color.withOpacity(0.1),
+                                      width: 1,
+                                    ),
+                                  ),
+                                  child: Icon(
+                                    Icons.inbox_outlined,
+                                    color: color.withOpacity(0.4),
+                                    size: isDesktop ? 48 : 36,
+                                  ),
+                                ),
+                                8.hGap,
+                                customTextWithClip(
+                                  text: isAccepting
+                                      ? 'Drop task here'
+                                      : 'No tasks here',
+                                  textColor: isAccepting
+                                      ? color
+                                      : Theme.of(context)
+                                              .textTheme
+                                              .bodySmall
+                                              ?.color ??
+                                          Colors.grey,
+                                  fontSize: isDesktop ? 14 : 12,
+                                  fontWeight: FontWeight.w500,
+                                  textAlign: TextAlign.center,
+                                ),
+                              ],
+                            ),
+                          )
+                        : SingleChildScrollView(
+                            child: AnimationLimiter(
+                              child: Column(
+                                children:
+                                    AnimationConfiguration.toStaggeredList(
+                                  duration: const Duration(milliseconds: 375),
+                                  childAnimationBuilder: (widget) =>
+                                      SlideAnimation(
+                                    verticalOffset: 50.0,
+                                    child: FadeInAnimation(
+                                      child: widget,
+                                    ),
+                                  ),
+                                  children: taskWidgets
+                                      .map((widget) => Padding(
+                                            padding: const EdgeInsets.only(
+                                                bottom: 16),
+                                            child: widget,
+                                          ))
+                                      .toList(),
+                                ),
+                              ),
+                            ),
+                          ),
+                  ),
+                ),
+              ],
+            ),
+          );
+        },
+      );
+    }
+
+    // Build loading state
+    Widget buildLoadingState() {
+      return Center(
+        child: Column(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            CircularProgressIndicator(
+              valueColor: AlwaysStoppedAnimation<Color>(
+                  Theme.of(context).colorScheme.primary),
+            ),
+            16.hGap,
+            customTextWithClip(
+              text: 'Loading tasks...',
+              textColor:
+                  Theme.of(context).textTheme.bodyMedium?.color ?? Colors.grey,
+              fontSize: 16,
+              fontWeight: FontWeight.w500,
+            ),
+          ],
+        ),
+      );
+    }
+
+    // Build error state
+    Widget buildErrorState() {
+      return Center(
+        child: Column(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            Icon(
+              Icons.error_outline,
+              size: 64,
+              color: Theme.of(context).colorScheme.error,
+            ),
+            16.hGap,
+            customTextWithClip(
+              text: 'Error loading tasks',
+              textColor: Theme.of(context).colorScheme.error,
+              fontSize: 18,
+              fontWeight: FontWeight.bold,
+            ),
+            8.hGap,
+            customTextWithClip(
+              text: taskError.value ?? 'Unknown error',
+              textColor:
+                  Theme.of(context).textTheme.bodyMedium?.color ?? Colors.grey,
+              fontSize: 14,
+              fontWeight: FontWeight.normal,
+              textAlign: TextAlign.center,
+            ),
+            16.hGap,
+            ElevatedButton(
+              onPressed: refreshTasks,
+              style: ElevatedButton.styleFrom(
+                backgroundColor: Theme.of(context).colorScheme.primary,
+                foregroundColor: Theme.of(context).colorScheme.onPrimary,
+                padding:
+                    const EdgeInsets.symmetric(horizontal: 24, vertical: 12),
+                shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(8),
+                ),
+              ),
+              child: const Text('Retry'),
+            ),
+          ],
+        ),
+      );
+    }
+
+    // Debug: Show final task distribution
+    if (tasks.value.isNotEmpty) {
+      print('🎯 FINAL TASK DISTRIBUTION:');
+      print('📊 Total tasks: ${tasks.value.length}');
+      print(
+          '📋 TODO: ${kanbanViewModel.getTaskCountForStatus('todo')} | IN PROGRESS: ${kanbanViewModel.getTaskCountForStatus('inprogress')} | DEV COMPLETED: ${kanbanViewModel.getTaskCountForStatus('devcompleted')}');
+    }
+
+    // Get global search notifier for Kanban screen (index 6)
+    final globalSearchExpanded = getSearchNotifierForScreen(6);
+    final globalHasActiveFilters = getFiltersNotifierForScreen(6);
+    final globalFilterTrigger = getFilterTriggerForScreen(6);
+
+    // Sync local hasActiveFilters with global
+    useEffect(() {
+      final listener = () {
+        globalHasActiveFilters.value = hasActiveFilters.value;
+      };
+      hasActiveFilters.addListener(listener);
+      return () => hasActiveFilters.removeListener(listener);
+    }, [hasActiveFilters.value]);
+
+    // Listen to global filter trigger
+    useEffect(() {
+      final listener = () {
+        final filterOptions = kanbanViewModel.getFilterOptions();
+        _showFilterDialog(
+          context,
+          selectedPriorities,
+          selectedStatuses,
+          selectedProjects,
+          filterOptions,
+          () {
+            kanbanViewModel.clearFilters();
+            // No longer needed - handled by ViewModel;
+          },
+          // No longer needed
+          hasActiveFilters,
+        );
+      };
+      globalFilterTrigger.addListener(listener);
+      return () => globalFilterTrigger.removeListener(listener);
+    }, []);
+
+    // Create search filter config for expandable search
+    final searchFilterConfig = SearchFilterConfig(
+      searchController: searchController,
+      searchQuery: searchQuery,
+      hasActiveFilters: hasActiveFilters,
+      hintText: 'Search tasks...',
+      // Use global notifier for search expanded state
+      isSearchExpanded: globalSearchExpanded,
+      // Kanban screen search: just update the searchQuery, kanbanViewModel.filteredTasks will use it
+      onSearchChanged: (query) {
+        // The searchQuery.value is already updated in the widget
+        // kanbanViewModel.filteredTasks will automatically use it to filter tasks
+      },
+      // Optional: For search suggestions
+      getSearchSuggestions: (query) =>
+          kanbanViewModel.getSearchSuggestions(query),
+      showSuggestions: showSuggestions,
+      searchFocusNode: searchFocusNode,
+      searchBarKey: searchBarKey,
+      showSuggestionsOverlay: (context, key, suggestions, controller, query,
+          showSuggestionsVal, focusNode, isSmall) {
+        return _showSuggestionsOverlay(
+          context,
+          key,
+          suggestions,
+          controller,
+          query,
+          showSuggestionsVal ?? showSuggestions,
+          focusNode ?? searchFocusNode,
+          isSmall,
+        );
+      },
+      setSuggestionsOverlay: (overlay) {
+        suggestionsOverlay.value?.remove();
+        suggestionsOverlay.value = overlay;
+      },
+      onFilterTap: () {
+        final filterOptions = kanbanViewModel.getFilterOptions();
+        _showFilterDialog(
+          context,
+          selectedPriorities,
+          selectedStatuses,
+          selectedProjects,
+          filterOptions,
+          () {
+            kanbanViewModel.clearFilters();
+            // No longer needed - handled by ViewModel;
+          },
+          // No longer needed
+          hasActiveFilters,
+        );
+      },
+      activeFilterCount: selectedPriorities.value.length +
+          selectedStatuses.value.length +
+          selectedProjects.value.length,
+    );
+
+    final isSmallMobile = MediaQuery.of(context).size.width < 360;
+    final isMobile = MediaQuery.of(context).size.width >= 600 &&
+        MediaQuery.of(context).size.width < 1200;
+
+    return Scaffold(
+      backgroundColor: Theme.of(context).scaffoldBackgroundColor,
+      appBar: null, // No app bar - using header in body
+      floatingActionButton: null,
+      body: isLoading.value
+          ? buildLoadingState()
+          : taskError.value != null
+              ? buildErrorState()
+              : Column(
+                  children: [
+                    // Expandable Search Bar (if expanded)
+                    ValueListenableBuilder<bool>(
+                      valueListenable: searchFilterConfig.isSearchExpanded,
+                      builder: (context, isExpanded, child) {
+                        if (isExpanded) {
+                          return Padding(
+                            padding: const EdgeInsets.all(16),
+                            child: AppBarSearchFilter(
+                              config: searchFilterConfig,
+                              isDesktop: isDesktop,
+                              isMobile: isMobile,
+                              isSmallMobile: isSmallMobile,
+                            ),
+                          );
+                        }
+                        return const SizedBox.shrink();
+                      },
+                    ),
+                    // Kanban Board
+                    Expanded(
+                      child: LayoutBuilder(
+                        builder: (context, constraints) {
+                          final minHeight = constraints.maxHeight;
+                          final screenWidth = MediaQuery.of(context).size.width;
+                          final availableWidth = screenWidth - 32;
+
+                          // Calculate responsive column width for single row layout
+                          double columnWidth;
+
+                          if (screenWidth < 600) {
+                            // Mobile: Smaller columns for horizontal scroll
+                            columnWidth =
+                                (availableWidth * 0.85).clamp(200.0, 250.0);
+                          } else if (screenWidth < 900) {
+                            // Tablet: Medium columns
+                            columnWidth =
+                                (availableWidth * 0.8).clamp(220.0, 280.0);
+                          } else if (screenWidth < 1200) {
+                            // Small desktop: Larger columns
+                            columnWidth =
+                                (availableWidth * 0.75).clamp(250.0, 300.0);
+                          } else {
+                            // Large desktop: Maximum column width
+                            columnWidth =
+                                (availableWidth * 0.7).clamp(280.0, 350.0);
+                          }
+
+                          final padding = screenWidth < 600 ? 8.0 : 16.0;
+                          final columnSpacing = screenWidth < 600 ? 12.0 : 16.0;
+
+                          // Create all columns in a single row with horizontal scroll and scroll bar
+                          // Scroll controller is initialized in useEffect
+                          if (horizontalScrollController.value == null) {
+                            return const Center(
+                              child: CircularProgressIndicator(),
+                            );
+                          }
+
+                          return Scrollbar(
+                            controller: verticalScrollController.value,
+                            thumbVisibility:
+                                false, // Hover-based for cleaner UI
+                            trackVisibility: false,
+                            thickness: 10, // Easier to grab
+                            scrollbarOrientation: ScrollbarOrientation.right,
+                            child: SingleChildScrollView(
+                              controller: verticalScrollController.value,
+                              physics: const BouncingScrollPhysics(),
+                              child: ConstrainedBox(
+                                constraints:
+                                    BoxConstraints(minHeight: minHeight),
+                                child: Listener(
+                                  onPointerSignal: (pointerSignal) {
+                                    if (pointerSignal is PointerScrollEvent) {
+                                      final controller =
+                                          horizontalScrollController.value;
+                                      if (controller != null) {
+                                        // Shift+Scroll for horizontal scrolling
+                                        if (HardwareKeyboard
+                                            .instance.isShiftPressed) {
+                                          final newOffset = controller.offset +
+                                              pointerSignal.scrollDelta.dy;
+                                          controller.jumpTo(
+                                            newOffset.clamp(
+                                                0.0,
+                                                controller
+                                                    .position.maxScrollExtent),
+                                          );
+                                        }
+                                      }
+                                    }
+                                  },
+                                  child: Scrollbar(
+                                    controller:
+                                        horizontalScrollController.value!,
+                                    thumbVisibility: true, // Always visible
+                                    trackVisibility: true, // Always visible
+                                    thickness: 10, // Easier to grab
+                                    scrollbarOrientation:
+                                        ScrollbarOrientation.bottom,
+                                    child: SingleChildScrollView(
+                                      controller:
+                                          horizontalScrollController.value!,
+                                      scrollDirection: Axis.horizontal,
+                                      physics: const ClampingScrollPhysics(),
+                                      child: Padding(
+                                        padding: EdgeInsets.symmetric(
+                                          horizontal: padding,
+                                          vertical: isDesktop ? 24.0 : 16.0,
+                                        ),
+                                        child: AnimationLimiter(
+                                          child: Row(
+                                            crossAxisAlignment:
+                                                CrossAxisAlignment.start,
+                                            children: AnimationConfiguration
+                                                .toStaggeredList(
+                                              duration: const Duration(
+                                                  milliseconds: 375),
+                                              childAnimationBuilder: (widget) =>
+                                                  SlideAnimation(
+                                                horizontalOffset: 50.0,
+                                                child: FadeInAnimation(
+                                                  child: widget,
+                                                ),
+                                              ),
+                                              children: [
+                                                SizedBox(
+                                                  width: columnWidth,
+                                                  child: buildColumn(
+                                                      KanbanTaskStatus.todo,
+                                                      'To Do',
+                                                      const Color(0xFF6366F1)),
+                                                ),
+                                                SizedBox(width: columnSpacing),
+                                                SizedBox(
+                                                  width: columnWidth,
+                                                  child: buildColumn(
+                                                      KanbanTaskStatus
+                                                          .inProgress,
+                                                      'In Progress',
+                                                      const Color(0xFFF59E0B)),
+                                                ),
+                                                SizedBox(width: columnSpacing),
+                                                SizedBox(
+                                                  width: columnWidth,
+                                                  child: buildColumn(
+                                                      KanbanTaskStatus
+                                                          .devcompleted,
+                                                      'Dev Completed',
+                                                      const Color(0xFF10B981)),
+                                                ),
+                                                SizedBox(width: columnSpacing),
+                                                SizedBox(
+                                                  width: columnWidth,
+                                                  child: buildColumn(
+                                                      KanbanTaskStatus.inQc,
+                                                      'In QC',
+                                                      const Color(0xFF8B5CF6)),
+                                                ),
+                                                SizedBox(width: columnSpacing),
+                                                SizedBox(
+                                                  width: columnWidth,
+                                                  child: buildColumn(
+                                                      KanbanTaskStatus.workDone,
+                                                      'Work Done',
+                                                      const Color(0xFF059669)),
+                                                ),
+                                                SizedBox(width: columnSpacing),
+                                                SizedBox(
+                                                  width: columnWidth,
+                                                  child: buildColumn(
+                                                      KanbanTaskStatus.redo,
+                                                      'Redo',
+                                                      const Color(0xFFEF4444)),
+                                                ),
+                                              ],
+                                            ),
+                                          ),
+                                        ),
+                                      ),
+                                    ),
+                                  ),
+                                ),
+                              ),
+                            ),
+                          );
+                        },
+                      ),
+                    ),
+                  ],
+                ),
+    );
+  }
+}

@@ -1,0 +1,74 @@
+# -------------------------------
+# Flutter / Dart
+# -------------------------------
+.dart_tool/
+.packages
+.pub/
+.pub-cache/
+.flutter-plugins
+.flutter-plugins-dependencies
+
+# Ignore everything inside build/, but keep the build/ folder itself
+build/*
+!build/.gitkeep  # Optional: create an empty .gitkeep file if you want to force-track the folder
+
+# -------------------------------
+# FVM (Flutter Version Manager)
+# -------------------------------
+.fvm/
+
+# -------------------------------
+# Android
+# -------------------------------
+android/.gradle/
+android/app/build/
+android/local.properties
+*.apk
+*.aab
+
+# -------------------------------
+# iOS
+# -------------------------------
+ios/Pods/
+ios/.symlinks/
+ios/Flutter/ephemeral/
+ios/Flutter/Generated.xcconfig
+ios/Flutter/flutter_export_environment.sh
+ios/Runner.xcworkspace/
+
+# -------------------------------
+# macOS
+# -------------------------------
+macos/Pods/
+macos/Flutter/ephemeral/
+
+# -------------------------------
+# Web
+# -------------------------------
+web/.dart_tool/
+web/build/
+
+# -------------------------------
+# Windows / Linux
+# -------------------------------
+windows/flutter/ephemeral/
+linux/flutter/ephemeral/
+
+# -------------------------------
+# Media / Large assets (avoid committing large files >100MB)
+# -------------------------------
+*.mp4
+*.mov
+*.zip
+*.tar
+*.gz
+
+# -------------------------------
+# Logs & temp files
+# -------------------------------
+*.log
+*.tmp
+.DS_Store
+.idea/
+.vscode/
+

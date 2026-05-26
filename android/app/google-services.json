@@ -1,0 +1,48 @@
+{
+  "project_info": {
+    "project_number": "246504429530",
+    "project_id": "webnox-sprintly-55789",
+    "storage_bucket": "webnox-sprintly-55789.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:246504429530:android:b02950d91985e12ee212e3",
+        "android_client_info": {
+          "package_name": "com.webnox.sprintly_admin_frontend"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyCP3QXcwGVieCE8-Xo1h3U32Sg0dJ4hO8U"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    },
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:246504429530:android:1b3d1b8eafeeab87e212e3",
+        "android_client_info": {
+          "package_name": "com.webnox.webnox_taskops"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyCP3QXcwGVieCE8-Xo1h3U32Sg0dJ4hO8U"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
